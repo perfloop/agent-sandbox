@@ -141,6 +141,8 @@ func (c *connector) Connect(ctx context.Context) error {
 		mode = "gateway"
 	case *tunnelStrategy:
 		mode = "port-forward"
+	case *inClusterStrategy:
+		mode = "in-cluster"
 	}
 	c.log.Info("API URL discovered", "url", url, "mode", mode)
 	return nil
@@ -262,9 +264,18 @@ func (c *connector) SendRequest(ctx context.Context, method, endpoint string, bo
 			return nil, fmt.Errorf("sandbox: failed to create request: %w", err)
 		}
 
-		req.Header.Set(headerSandboxID, sandboxID)
-		req.Header.Set(headerSandboxNamespace, namespace)
-		req.Header.Set(headerSandboxPort, strconv.Itoa(port))
+		// Router-dispatch headers (X-Sandbox-ID, X-Sandbox-Namespace,
+		// X-Sandbox-Port) tell the sandbox-router which pod to forward
+		// to. The in-cluster strategy talks directly to the pod via
+		// cluster DNS, so these headers carry no meaning and the
+		// runtime server ignores them; suppressing them here matches
+		// the Python SDK's behavior in PR #489 and keeps the wire
+		// minimal. X-Request-ID stays for trace correlation.
+		if _, isInCluster := c.strategy.(*inClusterStrategy); !isInCluster {
+			req.Header.Set(headerSandboxID, sandboxID)
+			req.Header.Set(headerSandboxNamespace, namespace)
+			req.Header.Set(headerSandboxPort, strconv.Itoa(port))
+		}
 		req.Header.Set(headerRequestID, reqID)
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)

@@ -82,6 +82,12 @@ func New(_ context.Context, opts Options) (*Sandbox, error) {
 	// Select connection strategy based on options.
 	var strategy ConnectionStrategy
 	switch {
+	case opts.InClusterDirect:
+		strategy = &inClusterStrategy{
+			namespace:  opts.Namespace,
+			serverPort: opts.ServerPort,
+			scheme:     "http",
+		}
 	case opts.APIURL != "":
 		strategy = &DirectStrategy{URL: opts.APIURL}
 	case opts.GatewayName != "":
@@ -123,6 +129,11 @@ func New(_ context.Context, opts Options) (*Sandbox, error) {
 	// Wire tunnel's connector reference for death notifications.
 	if ts, ok := strategy.(*tunnelStrategy); ok {
 		ts.connector = conn
+	}
+	// Wire in-cluster strategy's connector reference so its Connect
+	// can read the sandbox name SetIdentity placed on the connector.
+	if ics, ok := strategy.(*inClusterStrategy); ok {
+		ics.connector = conn
 	}
 
 	s := &Sandbox{
