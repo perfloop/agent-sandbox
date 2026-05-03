@@ -152,8 +152,12 @@ func TestWrite_MultipartUpload(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if !strings.HasSuffix(r.URL.Path, "/upload") {
-			t.Errorf("expected /upload, got %s", r.URL.Path)
+		// perfloop fork: /upload now carries the original path as a
+		// percent-encoded URL segment, matching the download / list /
+		// exists shape. test.txt (a base filename) round-trips
+		// untouched after percentEncode, so the URL is /upload/test.txt.
+		if r.URL.Path != "/upload/test.txt" {
+			t.Errorf("expected /upload/test.txt, got %s", r.URL.Path)
 		}
 
 		mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -676,46 +680,22 @@ func TestRetry_NonSeekableBody(t *testing.T) {
 	}
 }
 
-// --- Write rejects directory paths ---
-
-func TestWrite_RejectsDirectoryPath(t *testing.T) {
-	c := newReadyTestSandbox("http://unused")
-	err := c.Write(context.Background(), "subdir/nested/file.txt", []byte("data"))
-	if err == nil {
-		t.Fatal("expected error for path with directory separators")
-	}
-	if !strings.Contains(err.Error(), "not a plain filename") {
-		t.Errorf("expected 'not a plain filename' error, got: %v", err)
-	}
-}
-
-// --- Write path validation ---
+// --- Write path validation (perfloop fork: only empty path is invalid) ---
 
 func TestWrite_InvalidPath(t *testing.T) {
-	cases := []struct {
-		name string
-		path string
-	}{
-		{"empty", ""},
-		{"dot", "."},
-		{"dotdot", ".."},
-		{"slash", "/"},
-		{"double-slash", "///"},
-		{"directory-path", "dir/file.txt"},
-		{"absolute-path", "/tmp/file.txt"},
-		{"relative-dot", "./file.txt"},
-	}
+	// perfloop fork (kubernetes-sigs/agent-sandbox#622): nested paths
+	// are forwarded to the runtime server as /upload/{percent-encoded-
+	// path} rather than rejected client-side. The only path that still
+	// errors locally is the empty string. Path safety is the runtime
+	// server's responsibility — its resolveWorkdirPath rejects
+	// traversal before any filesystem access.
 	c := newReadyTestSandbox("http://unused")
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := c.Write(context.Background(), tc.path, []byte("data"))
-			if err == nil {
-				t.Fatal("expected error for invalid path")
-			}
-			if !strings.Contains(err.Error(), "not a plain filename") {
-				t.Errorf("expected 'not a plain filename' error, got: %v", err)
-			}
-		})
+	err := c.Write(context.Background(), "", []byte("data"))
+	if err == nil {
+		t.Fatal("expected error for empty path")
+	}
+	if !strings.Contains(err.Error(), "path must not be empty") {
+		t.Errorf("expected 'path must not be empty' error, got: %v", err)
 	}
 }
 
@@ -1239,20 +1219,6 @@ func TestPerAttemptTimeout_BoundedByRequestTimeout(t *testing.T) {
 	// Must be bounded by RequestTimeout (300ms), not PerAttemptTimeout (5s).
 	if elapsed > 1*time.Second {
 		t.Fatalf("expected failure within ~300ms (RequestTimeout), took %s — PerAttemptTimeout leaked", elapsed)
-	}
-}
-
-// --- Write trailing-slash path ---
-
-func TestWrite_TrailingSlashPath(t *testing.T) {
-	c := newReadyTestSandbox("http://unused")
-	// "some/dir/" contains directory separators and should be rejected.
-	err := c.Write(context.Background(), "some/dir/", []byte("data"))
-	if err == nil {
-		t.Fatal("expected error for path with directory separators")
-	}
-	if !strings.Contains(err.Error(), "not a plain filename") {
-		t.Errorf("expected 'not a plain filename' error, got: %v", err)
 	}
 }
 

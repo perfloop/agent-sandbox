@@ -81,8 +81,18 @@ type Files struct {
 	lifecycleCtx func() context.Context
 }
 
-// Write uploads content to the sandbox. The path must be a plain filename
-// without directory separators (e.g., "script.py", not "dir/script.py").
+// Write uploads content to the sandbox at path. Nested paths are
+// supported: the original path is forwarded as a percent-encoded URL
+// segment (matching Read / List / Exists), so the runtime server can
+// route a write of "src/main.go" to its corresponding subdirectory.
+// The multipart filename keeps the base spelling for backwards
+// compatibility with runtime servers that read the multipart filename
+// and ignore the URL path. Path safety (rejecting traversal and
+// out-of-workdir spellings) is the runtime server's responsibility.
+//
+// This is a perfloop fork change tracked in
+// kubernetes-sigs/agent-sandbox#622; upstream still rejects nested
+// paths client-side.
 //
 // The entire content is buffered in memory as a multipart form body to
 // support retries on transient failures. Content exceeding MaxUploadSize
@@ -100,12 +110,21 @@ func (f *Files) Write(ctx context.Context, path string, content []byte, opts ...
 		return err
 	}
 
-	base := pathpkg.Base(path)
-	if base == "." || base == ".." || base == "/" || base != path {
-		err := fmt.Errorf("%s: write: %q is not a plain filename (resolved to %q); pass only the filename, not a path with directories", f.errPrefix(), path, base)
+	// perfloop fork (kubernetes-sigs/agent-sandbox#622): the original
+	// validation rejected anything where pathpkg.Base(path) != path,
+	// forcing callers to use base filenames only. The fork relaxes
+	// that to a non-empty check; the original path is forwarded to
+	// the runtime server in the URL (matching the download / list /
+	// exists shape) so nested paths land in subdirectories. The
+	// multipart filename keeps the base-only spelling for backwards
+	// compatibility with runtime servers that read the multipart
+	// filename and ignore the URL path.
+	if path == "" {
+		err := fmt.Errorf("%s: write: path must not be empty", f.errPrefix())
 		recordError(span, err)
 		return err
 	}
+	base := pathpkg.Base(path)
 	var buf bytes.Buffer
 	buf.Grow(len(content) + 512)
 	writer := multipart.NewWriter(&buf)
@@ -123,7 +142,7 @@ func (f *Files) Write(ctx context.Context, path string, content []byte, opts ...
 		return fmt.Errorf("%s: failed to close multipart writer: %w", f.errPrefix(), err)
 	}
 
-	resp, err := f.connector.SendRequest(ctx, http.MethodPost, "upload", bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), maxAttempts)
+	resp, err := f.connector.SendRequest(ctx, http.MethodPost, "upload/"+percentEncode(path), bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), maxAttempts)
 	if err != nil {
 		recordError(span, err)
 		return fmt.Errorf("%s: write(%q) failed: %w", f.errPrefix(), path, err)
