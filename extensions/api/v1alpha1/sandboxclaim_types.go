@@ -163,8 +163,18 @@ type SandboxClaimStatus struct {
 
 type SandboxStatus struct {
 	// name is the name of the Sandbox created from this claim
+	//
+	// perfloop fork: the GKE-managed agent-sandbox addon
+	// (components.gke.io/component-version 1.35.0 on GKE 1.35)
+	// ships a CRD whose status schema declares this field as
+	// "Name" (capital N). Upstream uses "name", so the Go SDK's
+	// resolveSandboxName never sees the populated status on a GKE
+	// Autopilot cluster — CreateSandbox times out at
+	// SandboxReadyTimeout with "sandbox name not resolved". Pinning
+	// the tag to the spelling the cluster actually emits is the
+	// smallest fix; once GKE catches up to upstream this can revert.
 	// +optional
-	Name string `json:"name,omitempty"`
+	Name string `json:"Name,omitempty"`
 
 	// podIPs are the IP addresses of the underlying pod.
 	// A pod may have multiple IPs in dual-stack clusters.
