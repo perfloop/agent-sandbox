@@ -46,7 +46,7 @@ func sandboxHTTPHandler() http.Handler {
 			_ = json.NewEncoder(w).Encode(ExecutionResult{Stdout: "hello", ExitCode: 0})
 		case strings.HasPrefix(r.URL.Path, "/download/"):
 			_, _ = w.Write([]byte("file-data"))
-		case r.URL.Path == "/upload":
+		case strings.HasPrefix(r.URL.Path, "/upload/"):
 			w.WriteHeader(http.StatusOK)
 		case strings.HasPrefix(r.URL.Path, "/list/"):
 			w.Header().Set("Content-Type", "application/json")
