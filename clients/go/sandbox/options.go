@@ -67,6 +67,25 @@ type Options struct {
 	// bypassing gateway discovery. Takes precedence over GatewayName.
 	APIURL string
 
+	// InClusterDirect enables in-cluster direct mode (perfloop fork
+	// addition; mirrors the Python SDK's
+	// SandboxInClusterConnectionConfig from upstream PR #489). When
+	// true, the SDK builds the API URL from the resolved sandbox
+	// identity:
+	//
+	//   http://{sandbox-name}.{namespace}.svc.cluster.local:{ServerPort}
+	//
+	// The connector also suppresses the router-dispatch headers
+	// (X-Sandbox-ID, X-Sandbox-Namespace, X-Sandbox-Port) since
+	// requests go straight to the pod and the runtime server does
+	// not consult those.
+	//
+	// Takes precedence over APIURL, GatewayName, and tunnel mode.
+	// Use this from in-cluster controllers and Jobs that resolve
+	// cluster DNS; out-of-cluster callers must use tunnel or
+	// gateway mode.
+	InClusterDirect bool
+
 	// ServerPort is the port the sandbox runtime listens on. Default: 8888.
 	ServerPort int
 
