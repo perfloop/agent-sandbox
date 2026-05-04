@@ -71,6 +71,7 @@ type CallOption func(*callOptions)
 type callOptions struct {
 	timeout     time.Duration
 	maxAttempts int // 0 = use default (maxAttempts const); 1 = no retry
+	maxBytes    int // 0 = use server default; n>0 caps Read response at n bytes
 }
 
 // WithTimeout sets the total timeout for a single operation, overriding
@@ -90,6 +91,24 @@ func WithMaxAttempts(n int) CallOption {
 	return func(o *callOptions) {
 		if n > 0 {
 			o.maxAttempts = n
+		}
+	}
+}
+
+// WithMaxBytes caps the Read response body server-side at n bytes.
+// Values ≤0 are ignored and the server returns the full file (subject
+// to its own MaxDownloadSize cap). When set, the client appends ?max=n
+// to the download URL and the runtime server applies an io.LimitReader
+// before streaming the body. This avoids pulling many MB across the
+// wire to slice them client-side.
+//
+// perfloop fork addition: upstream Files.Read has no per-call byte
+// cap, so a caller that wants an N-byte slice of an M-byte file pays
+// the full M-byte transfer.
+func WithMaxBytes(n int) CallOption {
+	return func(o *callOptions) {
+		if n > 0 {
+			o.maxBytes = n
 		}
 	}
 }

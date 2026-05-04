@@ -161,10 +161,20 @@ func (f *Files) Write(ctx context.Context, path string, content []byte, opts ...
 }
 
 // Read downloads a file from the sandbox.
+//
+// When WithMaxBytes(n) is set, the client appends ?max=n to the URL
+// and the runtime server caps the response body at n bytes via
+// io.LimitReader. Servers that ignore the query parameter return the
+// full file as before, capped only by MaxDownloadSize. perfloop fork
+// addition; upstream has no per-call read cap.
 func (f *Files) Read(ctx context.Context, path string, opts ...CallOption) ([]byte, error) {
 	defer f.trackOp()()
 	ctx, callCancel, maxAttempts := applyCallOpts(ctx, opts)
 	defer callCancel()
+	var co callOptions
+	for _, o := range opts {
+		o(&co)
+	}
 	ctx, span := startSpan(withLifecycleSpan(ctx, f.lifecycleCtx()), f.tracer, f.svcName, "read", AttrFilePath.String(path))
 	defer span.End()
 
@@ -175,7 +185,11 @@ func (f *Files) Read(ctx context.Context, path string, opts ...CallOption) ([]by
 	}
 
 	encoded := percentEncode(path)
-	resp, err := f.connector.SendRequest(ctx, http.MethodGet, "download/"+encoded, nil, "", maxAttempts)
+	endpoint := "download/" + encoded
+	if co.maxBytes > 0 {
+		endpoint = fmt.Sprintf("%s?max=%d", endpoint, co.maxBytes)
+	}
+	resp, err := f.connector.SendRequest(ctx, http.MethodGet, endpoint, nil, "", maxAttempts)
 	if err != nil {
 		recordError(span, err)
 		return nil, fmt.Errorf("%s: read(%q) failed: %w", f.errPrefix(), path, err)
