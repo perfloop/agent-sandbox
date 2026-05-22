@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -124,6 +125,8 @@ type Handle interface {
 	IsReady() bool
 
 	Run(ctx context.Context, command string, opts ...CallOption) (*ExecutionResult, error)
+	OpenReader(ctx context.Context, path string, opts ...CallOption) (io.ReadCloser, error)
+	CreateWriter(ctx context.Context, path string, opts ...CallOption) (io.WriteCloser, error)
 	Write(ctx context.Context, path string, content []byte, opts ...CallOption) error
 	Read(ctx context.Context, path string, opts ...CallOption) ([]byte, error)
 	List(ctx context.Context, path string, opts ...CallOption) ([]FileEntry, error)

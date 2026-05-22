@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"sync"
 	"time"
@@ -528,6 +529,12 @@ func (s *Sandbox) Files() *Files { return s.files }
 
 func (s *Sandbox) Run(ctx context.Context, command string, opts ...CallOption) (*ExecutionResult, error) {
 	return s.commands.Run(ctx, command, opts...)
+}
+func (s *Sandbox) OpenReader(ctx context.Context, path string, opts ...CallOption) (io.ReadCloser, error) {
+	return s.files.OpenReader(ctx, path, opts...)
+}
+func (s *Sandbox) CreateWriter(ctx context.Context, path string, opts ...CallOption) (io.WriteCloser, error) {
+	return s.files.CreateWriter(ctx, path, opts...)
 }
 func (s *Sandbox) Write(ctx context.Context, path string, content []byte, opts ...CallOption) error {
 	return s.files.Write(ctx, path, content, opts...)
