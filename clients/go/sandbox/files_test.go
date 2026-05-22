@@ -196,6 +196,80 @@ func TestWrite_MultipartUpload(t *testing.T) {
 	}
 }
 
+func TestCreateWriter_StreamsBeforeClose(t *testing.T) {
+	gotFirstChunk := make(chan string, 1)
+	allowClose := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil {
+			t.Errorf("parse Content-Type: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !strings.HasPrefix(mediaType, "multipart/") {
+			t.Errorf("content type = %q, want multipart", mediaType)
+			http.Error(w, "bad content type", http.StatusBadRequest)
+			return
+		}
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		part, err := reader.NextPart()
+		if err != nil {
+			t.Errorf("NextPart: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(part, buf); err != nil {
+			t.Errorf("ReadFull first chunk: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotFirstChunk <- string(buf)
+		<-allowClose
+		rest, err := io.ReadAll(part)
+		if err != nil {
+			t.Errorf("ReadAll rest: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if string(rest) != " world" {
+			t.Errorf("rest = %q, want %q", rest, " world")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := newReadyTestSandbox(server.URL)
+	writer, err := c.CreateWriter(context.Background(), "stream.txt")
+	if err != nil {
+		t.Fatalf("CreateWriter: %v", err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := writer.Write([]byte("hello"))
+		writeDone <- err
+	}()
+
+	select {
+	case got := <-gotFirstChunk:
+		if got != "hello" {
+			t.Fatalf("first chunk = %q, want hello", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive first chunk before writer close")
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("Write first chunk: %v", err)
+	}
+	close(allowClose)
+	if _, err := writer.Write([]byte(" world")); err != nil {
+		t.Fatalf("Write second chunk: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 func TestRead_ReturnsContent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -215,6 +289,43 @@ func TestRead_ReturnsContent(t *testing.T) {
 	}
 	if string(data) != "file content here" {
 		t.Errorf("expected 'file content here', got %q", string(data))
+	}
+}
+
+func TestOpenReader_StreamsBody(t *testing.T) {
+	bodyMayFinish := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("httptest response writer is not a flusher")
+		}
+		_, _ = w.Write([]byte("hello"))
+		flusher.Flush()
+		<-bodyMayFinish
+		_, _ = w.Write([]byte(" world"))
+	}))
+	defer server.Close()
+
+	c := newReadyTestSandbox(server.URL)
+	reader, err := c.OpenReader(context.Background(), "stream.txt")
+	if err != nil {
+		t.Fatalf("OpenReader: %v", err)
+	}
+	defer reader.Close()
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		t.Fatalf("ReadFull first chunk: %v", err)
+	}
+	if string(buf) != "hello" {
+		t.Fatalf("first chunk = %q, want hello", buf)
+	}
+	close(bodyMayFinish)
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll rest: %v", err)
+	}
+	if string(rest) != " world" {
+		t.Fatalf("rest = %q, want %q", rest, " world")
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -79,6 +80,157 @@ type Files struct {
 	errPrefix    func() string
 	trackOp      func() func()
 	lifecycleCtx func() context.Context
+}
+
+// CreateWriter streams content to the sandbox at path.
+//
+// The returned writer sends a multipart upload body as the caller writes.
+// It does not build the multipart body in memory. Close waits for the
+// sandbox runtime response and returns any upload or HTTP status error.
+//
+// Streaming uploads are one-shot: the request body cannot be replayed after
+// bytes have been handed to net/http, so the SDK disables request retries for
+// this method. Callers that need retry can create a fresh writer and resend
+// the content.
+func (f *Files) CreateWriter(ctx context.Context, path string, opts ...CallOption) (io.WriteCloser, error) {
+	cleanup := f.trackOp()
+	ctx, callCancel, _ := applyCallOpts(ctx, opts)
+	ctx, span := startSpan(withLifecycleSpan(ctx, f.lifecycleCtx()), f.tracer, f.svcName, "write", AttrFilePath.String(path))
+
+	fail := func(err error) (io.WriteCloser, error) {
+		recordError(span, err)
+		span.End()
+		callCancel()
+		cleanup()
+		return nil, err
+	}
+
+	if path == "" {
+		return fail(fmt.Errorf("%s: write: path must not be empty", f.errPrefix()))
+	}
+	base := pathpkg.Base(path)
+	bodyReader, bodyWriter := io.Pipe()
+	requestReader, requestWriter := io.Pipe()
+	multipartWriter := multipart.NewWriter(requestWriter)
+	result := make(chan error, 1)
+
+	go func() {
+		defer bodyReader.Close()
+		part, err := multipartWriter.CreateFormFile("file", base)
+		if err == nil {
+			_, err = io.Copy(part, bodyReader)
+		}
+		if err != nil {
+			_ = requestWriter.CloseWithError(err)
+			return
+		}
+		if err := multipartWriter.Close(); err != nil {
+			_ = requestWriter.CloseWithError(err)
+			return
+		}
+		_ = requestWriter.Close()
+	}()
+
+	go func() {
+		resp, err := f.connector.SendRequest(ctx, http.MethodPost, "upload/"+percentEncode(path), requestReader, multipartWriter.FormDataContentType(), 1)
+		if err != nil {
+			result <- fmt.Errorf("%s: write(%q) failed: %w", f.errPrefix(), path, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+			result <- fmt.Errorf("%s: write(%q): %w", f.errPrefix(), path, &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Operation: "write"})
+			return
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
+		result <- nil
+	}()
+
+	return &fileWriter{
+		body:      bodyWriter,
+		result:    result,
+		span:      span,
+		cancel:    callCancel,
+		cleanup:   cleanup,
+		log:       f.log,
+		path:      path,
+		errPrefix: f.errPrefix(),
+		maxUpload: f.maxUpload,
+	}, nil
+}
+
+type fileWriter struct {
+	body      *io.PipeWriter
+	result    <-chan error
+	span      trace.Span
+	cancel    context.CancelFunc
+	cleanup   func()
+	log       logr.Logger
+	path      string
+	errPrefix string
+	maxUpload int64
+	size      int64
+	closed    bool
+	err       error
+}
+
+func (w *fileWriter) Write(p []byte) (int, error) {
+	if w.closed {
+		return 0, errors.New("sandbox: write after close")
+	}
+	if w.err != nil {
+		return 0, w.err
+	}
+	if int64(len(p)) > w.maxUpload-w.size {
+		err := fmt.Errorf("%s: write(%q): content size exceeds MaxUploadSize %d", w.errPrefix, w.path, w.maxUpload)
+		w.fail(err)
+		return 0, err
+	}
+	n, err := w.body.Write(p)
+	w.size += int64(n)
+	if err != nil {
+		w.fail(err)
+		return n, err
+	}
+	return n, nil
+}
+
+func (w *fileWriter) Close() error {
+	if w.closed {
+		return w.err
+	}
+	w.closed = true
+	closeErr := w.body.Close()
+	resultErr := <-w.result
+	err := w.err
+	if err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = resultErr
+	}
+	w.span.SetAttributes(AttrFileSize.Int(int(w.size)))
+	if err != nil {
+		recordError(w.span, err)
+	} else {
+		w.log.V(1).Info("write completed", "path", w.path, "size", w.size)
+	}
+	w.err = err
+	w.span.End()
+	w.cancel()
+	w.cleanup()
+	return err
+}
+
+func (w *fileWriter) fail(err error) {
+	if w.err == nil {
+		w.err = err
+		recordError(w.span, err)
+	}
+	_ = w.body.CloseWithError(err)
+	w.cancel()
 }
 
 // Write uploads content to the sandbox at path. Nested paths are
@@ -158,6 +310,94 @@ func (f *Files) Write(ctx context.Context, path string, content []byte, opts ...
 	defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)) }()
 	f.log.V(1).Info("write completed", "path", path, "size", len(content))
 	return nil
+}
+
+// OpenReader streams a file from the sandbox.
+//
+// The response body is returned directly to the caller; the SDK does not read
+// it into memory. The caller must close the returned reader. WithMaxBytes still
+// applies the server-side ?max= cap before the body is streamed.
+func (f *Files) OpenReader(ctx context.Context, path string, opts ...CallOption) (io.ReadCloser, error) {
+	cleanup := f.trackOp()
+	ctx, callCancel, maxAttempts := applyCallOpts(ctx, opts)
+	var co callOptions
+	for _, o := range opts {
+		o(&co)
+	}
+	ctx, span := startSpan(withLifecycleSpan(ctx, f.lifecycleCtx()), f.tracer, f.svcName, "read", AttrFilePath.String(path))
+
+	fail := func(err error) (io.ReadCloser, error) {
+		recordError(span, err)
+		span.End()
+		callCancel()
+		cleanup()
+		return nil, err
+	}
+
+	if path == "" {
+		return fail(fmt.Errorf("%s: read: path must not be empty", f.errPrefix()))
+	}
+
+	endpoint := "download/" + percentEncode(path)
+	if co.maxBytes > 0 {
+		endpoint = fmt.Sprintf("%s?max=%d", endpoint, co.maxBytes)
+	}
+	resp, err := f.connector.SendRequest(ctx, http.MethodGet, endpoint, nil, "", maxAttempts)
+	if err != nil {
+		return fail(fmt.Errorf("%s: read(%q) failed: %w", f.errPrefix(), path, err))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+		return fail(fmt.Errorf("%s: read(%q): %w", f.errPrefix(), path, &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Operation: "read"}))
+	}
+
+	return &fileReader{
+		body:    resp.Body,
+		span:    span,
+		cancel:  callCancel,
+		cleanup: cleanup,
+		log:     f.log,
+		path:    path,
+	}, nil
+}
+
+type fileReader struct {
+	body    io.ReadCloser
+	span    trace.Span
+	cancel  context.CancelFunc
+	cleanup func()
+	log     logr.Logger
+	path    string
+	size    int
+	closed  bool
+}
+
+func (r *fileReader) Read(p []byte) (int, error) {
+	n, err := r.body.Read(p)
+	r.size += n
+	if err != nil && err != io.EOF {
+		recordError(r.span, err)
+	}
+	return n, err
+}
+
+func (r *fileReader) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	err := r.body.Close()
+	r.span.SetAttributes(AttrFileSize.Int(r.size))
+	if err != nil {
+		recordError(r.span, err)
+	} else {
+		r.log.V(1).Info("read completed", "path", r.path, "size", r.size)
+	}
+	r.span.End()
+	r.cancel()
+	r.cleanup()
+	return err
 }
 
 // Read downloads a file from the sandbox.
