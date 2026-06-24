@@ -1,5 +1,6 @@
 # For the API server
-fastapi
+fastapi>=0.138.0
+starlette>=1.3.1
 uvicorn
 pytest
 httpx
