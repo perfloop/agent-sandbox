@@ -1,7 +1,7 @@
 # For the API server
 fastapi
 uvicorn
-python-multipart
+python-multipart>=0.0.31
 
 # For the ML agent's tasks
 pandas
